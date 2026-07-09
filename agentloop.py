@@ -32,7 +32,9 @@ from claude_runner import (
 from trello_client import TrelloClient
 
 SHA_MARKER_RE = re.compile(r"\[agentloop\] before=(\S+) after=(\S+)")
-CLEANUP_ATTEMPTS_RE = re.compile(r"attempts=(\d+)")
+CLEANUP_PENDING_RE = re.compile(
+    r"^\[agentloop\] cleanup pending: branch=(\S+) attempts=(\d+)", re.MULTILINE)
+CLEANUP_WORKTREE_RE = re.compile(r"^worktree=(.*)$", re.MULTILINE)
 
 # After this many failed retries, stop retrying and leave a permanent
 # comment instead of retrying silently forever.
@@ -301,9 +303,12 @@ def review(
             log(f"Merged '{branch}' for '{card['name']}' but cleanup failed: {exc}")
             client.add_comment(
                 card["id"],
-                f"[agentloop] cleanup pending: branch={branch} attempts=1 error={exc}",
+                f"[agentloop] cleanup pending: branch={branch} attempts=1\n"
+                f"worktree={worktree}\nerror={exc}",
             )
-            pending_cleanup[card["id"]] = {"card": card, "attempt": 1}
+            pending_cleanup[card["id"]] = {
+                "card": card, "branch": branch, "worktree": worktree, "attempt": 1,
+            }
     else:
         issues = "\n".join(f"- {issue}" for issue in verdict.get("issues", []))
         client.add_comment(
@@ -318,7 +323,13 @@ def discover_pending_cleanups(client: TrelloClient, done_list_id: str) -> dict[s
     restarted process reattaches to them. This is intentionally called once
     at startup rather than every poll pass — scanning comments for every
     card in Done on every pass would grow unbounded over the life of a
-    long-running loop."""
+    long-running loop.
+
+    Branch and worktree are parsed out of the literal comment text (the
+    values recorded at the moment the worktree/branch were actually
+    created), not recomputed from the card's current name — recomputing
+    would silently point at the wrong path if the card gets renamed while
+    cleanup is pending, since branch_name_for_card slugifies the card name."""
     pending: dict[str, dict] = {}
     for card in client.cards_in_list(done_list_id):
         comments = client.comments(card["id"])
@@ -334,44 +345,52 @@ def discover_pending_cleanups(client: TrelloClient, done_list_id: str) -> dict[s
         )
         if marker is None:
             continue
-        match = CLEANUP_ATTEMPTS_RE.search(marker)
-        attempt = int(match.group(1)) if match else 1
-        pending[card["id"]] = {"card": card, "attempt": attempt}
+        header = CLEANUP_PENDING_RE.search(marker)
+        worktree_match = CLEANUP_WORKTREE_RE.search(marker)
+        if header is None or worktree_match is None:
+            continue
+        branch = header.group(1)
+        attempt = int(header.group(2))
+        worktree = worktree_match.group(1)
+        pending[card["id"]] = {
+            "card": card, "branch": branch, "worktree": worktree, "attempt": attempt,
+        }
     return pending
 
 
 def retry_pending_cleanup(
-    client: TrelloClient, card: dict, repo: str, worktree_root: str, attempt: int
+    client: TrelloClient, card: dict, repo: str, branch: str, worktree: str, attempt: int
 ) -> int | None:
     """Retries worktree/branch removal for a merged card whose cleanup failed
-    earlier. Branch and worktree are recomputed deterministically from the
-    card rather than parsed out of the comment text, so a worktree path
-    containing spaces (e.g. under a directory named "My Documents") can't
-    break parsing. Returns the next attempt count if cleanup is still
-    pending, or None once it's resolved (cleaned up, or abandoned after
-    MAX_CLEANUP_ATTEMPTS)."""
-    branch = branch_name_for_card(card)
-    worktree = worktree_path_for(worktree_root, branch)
+    earlier, using the literal branch/worktree recorded when the cleanup
+    first failed (see discover_pending_cleanups) rather than recomputing
+    them from the card. `attempt` is the number of attempts already made
+    before this call; this call makes the next one. Returns the updated
+    attempt count if cleanup is still pending, or None once it's resolved
+    (cleaned up, or abandoned after MAX_CLEANUP_ATTEMPTS)."""
+    current_attempt = attempt + 1
     try:
         remove_worktree(repo, worktree, branch)
     except RuntimeError as exc:
-        if attempt >= MAX_CLEANUP_ATTEMPTS:
+        if current_attempt >= MAX_CLEANUP_ATTEMPTS:
             log(
-                f"Cleanup for '{card['name']}' failed {attempt} times, giving up: {exc}"
+                f"Cleanup for '{card['name']}' failed {current_attempt} times, giving up: {exc}"
             )
             client.add_comment(
                 card["id"],
-                f"[agentloop] cleanup abandoned: branch={branch} worktree={worktree} "
-                f"failed after {attempt} attempts, remove manually: {exc}",
+                f"[agentloop] cleanup abandoned: branch={branch} attempts={current_attempt}\n"
+                f"worktree={worktree}\n"
+                f"failed permanently, remove manually\nerror={exc}",
             )
             return None
-        next_attempt = attempt + 1
-        log(f"Retry cleanup for '{card['name']}' still failing (attempt {attempt}): {exc}")
+        log(
+            f"Retry cleanup for '{card['name']}' still failing (attempt {current_attempt}): {exc}")
         client.add_comment(
             card["id"],
-            f"[agentloop] cleanup pending: branch={branch} attempts={next_attempt} error={exc}",
+            f"[agentloop] cleanup pending: branch={branch} attempts={current_attempt}\n"
+            f"worktree={worktree}\nerror={exc}",
         )
-        return next_attempt
+        return current_attempt
 
     log(f"Cleaned up branch '{branch}' for '{card['name']}' on retry")
     client.add_comment(card["id"], f"[agentloop] cleanup done: branch={branch}")
@@ -411,7 +430,8 @@ def run_loop(
             for card_id in list(pending_cleanup.keys()):
                 entry = pending_cleanup[card_id]
                 next_attempt = retry_pending_cleanup(
-                    client, entry["card"], repo, worktree_root, entry["attempt"])
+                    client, entry["card"], repo, entry["branch"], entry["worktree"],
+                    entry["attempt"])
                 if next_attempt is None:
                     del pending_cleanup[card_id]
                 else:
