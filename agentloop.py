@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""Simple agentic loop over a Trello kanban board, powered by a Claude
+subscription (Claude Code CLI, headless) instead of massive API parallelism.
+
+Kanban mapping:
+    To Do       -> picked up and moved to In Progress
+    In Progress -> implementer works here (writes code, commits)
+    In Review   -> adversarial reviewer works here (reads the diff only)
+    Done        -> reviewer approved
+    Needs Human -> too many review rounds without approval, stops looping
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+import time
+
+from dotenv import load_dotenv
+
+from claude_runner import ClaudeRunError, extract_json_block, git, run_claude
+from trello_client import TrelloClient
+
+SHA_MARKER_RE = re.compile(r"\[agentloop\] before=(\S+) after=(\S+)")
+
+IMPLEMENTER_RULES = (
+    "You are operating unattended in headless mode as part of an automated "
+    "kanban pipeline. Rules:\n"
+    "- Never run `git reset --hard`, `git stash`, or `git clean -f`.\n"
+    "- Stage only the specific files you changed (`git add <file>`), never "
+    "`git add -A` or `git add .`.\n"
+    "- Make exactly one commit for this task before finishing.\n"
+    "- Do not leave stub functions or TODO placeholders — implement the task "
+    "fully.\n"
+    "- Do not write long comments justifying a workaround; fix the root "
+    "cause instead."
+)
+
+REVIEWER_RULES = (
+    "You are an adversarial code reviewer. Assume the diff below is wrong "
+    "until proven otherwise. Look for concrete bugs: logic errors, edge "
+    "cases, resource/memory issues, incorrect assumptions. Reject any "
+    "comment in the diff that merely justifies a workaround instead of "
+    "fixing the root cause. You are read-only — do not modify any files.\n\n"
+    "End your response with exactly one fenced json block:\n"
+    '```json\n{"verdict": "approve" or "request_changes", "summary": '
+    '"...", "issues": ["..."]}\n```'
+)
+
+
+def log(msg: str) -> None:
+    print(f"[agentloop] {msg}", flush=True)
+
+
+def resolve_list_ids(client: TrelloClient, names: dict[str, str]) -> dict[str, str | None]:
+    resolved = {}
+    for key, name in names.items():
+        list_id = client.list_id_by_name(name)
+        if list_id is None and key != "needs_human":
+            raise SystemExit(
+                f"Could not find Trello list named '{name}' on the board")
+        resolved[key] = list_id
+    return resolved
+
+
+def latest_request_changes_comment(comments: list[str]) -> str | None:
+    for text in comments:
+        if text.startswith("[review] REQUEST_CHANGES"):
+            return text
+    return None
+
+
+def count_request_changes(comments: list[str]) -> int:
+    return sum(1 for text in comments if text.startswith("[review] REQUEST_CHANGES"))
+
+
+def parse_last_shas(comments: list[str]) -> tuple[str, str] | tuple[None, None]:
+    for text in comments:
+        match = SHA_MARKER_RE.search(text)
+        if match:
+            return match.group(1), match.group(2)
+    return None, None
+
+
+def build_implement_prompt(card: dict, feedback: str | None) -> str:
+    prompt = f"Task from Trello card '{card['name']}':\n\n{card.get('desc') or '(no description)'}"
+    if feedback:
+        prompt += f"\n\nA previous review requested changes:\n{feedback}\n\nAddress this feedback."
+    return prompt
+
+
+def build_review_prompt(card: dict, diff: str) -> str:
+    return (
+        f"You are reviewing a code change for the Trello task '{card['name']}'.\n\n"
+        f"Task description:\n{card.get('desc') or '(no description)'}\n\n"
+        f"Diff to review:\n```diff\n{diff}\n```\n\n{REVIEWER_RULES}"
+    )
+
+
+def implement(client: TrelloClient, card: dict, repo: str, list_ids: dict, dry_run: bool) -> None:
+    comments = client.comments(card["id"])
+    feedback = latest_request_changes_comment(comments)
+    prompt = build_implement_prompt(card, feedback)
+
+    if dry_run:
+        log(f"[dry-run] would implement '{card['name']}' with prompt:\n{prompt}")
+        return
+
+    log(f"Implementing '{card['name']}'")
+    before_sha = git(["rev-parse", "HEAD"], repo)
+    try:
+        run_claude(
+            prompt,
+            cwd=repo,
+            permission_mode="bypassPermissions",
+            append_system_prompt=IMPLEMENTER_RULES,
+        )
+    except ClaudeRunError as exc:
+        log(f"Implementer failed on '{card['name']}': {exc}")
+        client.add_comment(card["id"], f"[agentloop] implementer error: {exc}")
+        return
+    after_sha = git(["rev-parse", "HEAD"], repo)
+
+    client.add_comment(
+        card["id"], f"[agentloop] before={before_sha} after={after_sha}")
+    client.move_card(card["id"], list_ids["in_review"])
+
+
+def review(
+    client: TrelloClient,
+    card: dict,
+    repo: str,
+    list_ids: dict,
+    max_review_rounds: int,
+    dry_run: bool,
+) -> None:
+    comments = client.comments(card["id"])
+    before_sha, after_sha = parse_last_shas(comments)
+    if before_sha is None:
+        log(f"'{card['name']}' is in In Review with no [agentloop] marker — skipping")
+        return
+
+    rounds_so_far = count_request_changes(comments)
+    if rounds_so_far >= max_review_rounds:
+        log(f"'{card['name']}' hit max review rounds ({max_review_rounds})")
+        if not dry_run and list_ids.get("needs_human"):
+            client.add_comment(
+                card["id"],
+                f"[agentloop] stuck after {rounds_so_far} review rounds, needs a human",
+            )
+            client.move_card(card["id"], list_ids["needs_human"])
+        return
+
+    diff = git(["diff", f"{before_sha}..{after_sha}"], repo)
+    prompt = build_review_prompt(card, diff)
+
+    if dry_run:
+        log(f"[dry-run] would review '{card['name']}' with diff of {len(diff)} chars")
+        return
+
+    log(f"Reviewing '{card['name']}'")
+    try:
+        result = run_claude(prompt, cwd=repo, permission_mode="plan")
+    except ClaudeRunError as exc:
+        log(f"Reviewer failed on '{card['name']}': {exc}")
+        return
+
+    verdict = extract_json_block(result.get("result", ""))
+    if verdict is None:
+        log(
+            f"Could not parse a verdict for '{card['name']}', leaving it in In Review")
+        return
+
+    if verdict.get("verdict") == "approve":
+        client.add_comment(
+            card["id"], f"[review] APPROVE: {verdict.get('summary', '')}")
+        client.move_card(card["id"], list_ids["done"])
+    else:
+        issues = "\n".join(f"- {issue}" for issue in verdict.get("issues", []))
+        client.add_comment(
+            card["id"],
+            f"[review] REQUEST_CHANGES: {verdict.get('summary', '')}\n{issues}",
+        )
+        client.move_card(card["id"], list_ids["in_progress"])
+
+
+def run_loop(client: TrelloClient, repo: str, list_ids: dict, args: argparse.Namespace) -> None:
+    while True:
+        todo_cards = client.cards_in_list(list_ids["todo"])
+        for card in todo_cards[: args.concurrency]:
+            log(f"Picking up '{card['name']}' from To Do")
+            if not args.dry_run:
+                client.move_card(card["id"], list_ids["in_progress"])
+            implement(client, card, repo, list_ids, args.dry_run)
+
+        for card in client.cards_in_list(list_ids["in_progress"]):
+            implement(client, card, repo, list_ids, args.dry_run)
+
+        for card in client.cards_in_list(list_ids["in_review"]):
+            review(client, card, repo, list_ids,
+                   args.max_review_rounds, args.dry_run)
+
+        if args.once:
+            break
+        time.sleep(args.interval)
+
+
+def main() -> None:
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", required=True,
+                        help="path to the local git checkout to work on")
+    parser.add_argument("--once", action="store_true",
+                        help="run a single pass and exit")
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=int(os.environ.get("POLL_INTERVAL_SECONDS", "60")),
+        help="seconds to sleep between polling passes",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="max cards to pick up from To Do per pass (keep low for a subscription plan)",
+    )
+    parser.add_argument(
+        "--max-review-rounds",
+        type=int,
+        default=3,
+        help="after this many REQUEST_CHANGES rounds, move the card to Needs Human",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="don't call claude or mutate Trello, just print what would happen",
+    )
+    args = parser.parse_args()
+
+    api_key = os.environ.get("TRELLO_API_KEY")
+    token = os.environ.get("TRELLO_TOKEN")
+    board_id = os.environ.get("TRELLO_BOARD_ID")
+    if not (api_key and token and board_id):
+        sys.exit(
+            "TRELLO_API_KEY, TRELLO_TOKEN and TRELLO_BOARD_ID must be set (see .env.example)")
+
+    client = TrelloClient(api_key, token, board_id)
+    list_ids = resolve_list_ids(
+        client,
+        {
+            "todo": os.environ.get("TODO_LIST_NAME", "To Do"),
+            "in_progress": os.environ.get("IN_PROGRESS_LIST_NAME", "In Progress"),
+            "in_review": os.environ.get("IN_REVIEW_LIST_NAME", "In Review"),
+            "done": os.environ.get("DONE_LIST_NAME", "Done"),
+            "needs_human": os.environ.get("NEEDS_HUMAN_LIST_NAME", "Needs Human"),
+        },
+    )
+
+    run_loop(client, args.repo, list_ids, args)
+
+
+if __name__ == "__main__":
+    main()
