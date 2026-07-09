@@ -58,8 +58,44 @@ REVIEWER_RULES = (
 )
 
 
+REQUIRED_DOCS = ("CONVENTIONS.md", "CONTEXT.md")
+
+
 def log(msg: str) -> None:
     print(f"[agentloop] {msg}", flush=True)
+
+
+def missing_docs(repo: str) -> list[str]:
+    docs_dir = os.path.join(repo, "docs")
+    return [name for name in REQUIRED_DOCS
+            if not os.path.isfile(os.path.join(docs_dir, name))]
+
+
+def check_docs_or_confirm(repo: str, assume_yes: bool) -> None:
+    missing = missing_docs(repo)
+    if not missing:
+        return
+
+    log(
+        f"warning: {repo} is missing docs/{' and docs/'.join(missing)}. "
+        "Without project conventions/context, the implementer is more likely "
+        "to hallucinate or diverge from how this codebase actually works."
+    )
+
+    if assume_yes:
+        log("--yes passed, continuing despite missing docs")
+        return
+
+    if not sys.stdin.isatty():
+        raise SystemExit(
+            "Refusing to continue without docs/CONVENTIONS.md and docs/CONTEXT.md "
+            "in a non-interactive session. Add the missing file(s) or re-run with "
+            "--yes to proceed anyway."
+        )
+
+    answer = input("Continue anyway? [y/N] ").strip().lower()
+    if answer not in ("y", "yes"):
+        raise SystemExit("Aborted: missing docs/CONVENTIONS.md and/or docs/CONTEXT.md")
 
 
 def resolve_list_ids(client: TrelloClient, names: dict[str, str]) -> dict[str, str | None]:
@@ -312,7 +348,15 @@ def main() -> None:
         help="directory to hold per-card git worktrees "
              "(default: a .agentloop-worktrees folder next to --repo)",
     )
+    parser.add_argument(
+        "-y", "--yes",
+        action="store_true",
+        help="skip the confirmation prompt when --repo is missing "
+             "docs/CONVENTIONS.md or docs/CONTEXT.md",
+    )
     args = parser.parse_args()
+
+    check_docs_or_confirm(args.repo, args.yes)
 
     api_key = os.environ.get("TRELLO_API_KEY")
     token = os.environ.get("TRELLO_TOKEN")

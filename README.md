@@ -89,6 +89,11 @@ python agentloop.py --repo /path/to/target/repo
 | `--dry-run` | off | don't call `claude` or mutate Trello, just log what would happen |
 | `--base-branch` | `--repo`'s current branch | branch each card's worktree is created from and merged back into on approval |
 | `--worktree-dir` | `.agentloop-worktrees` next to `--repo` | directory holding per-card git worktrees |
+| `-y`, `--yes` | off | skip the confirmation prompt when `--repo` is missing `docs/CONVENTIONS.md` or `docs/CONTEXT.md` |
+
+## Docs check
+
+At startup, the script checks `--repo` for `docs/CONVENTIONS.md` and `docs/CONTEXT.md`. Without them, the implementer has no project-specific conventions or context to ground its work in, which makes hallucination and drift from how the codebase actually works more likely. If either file is missing, a warning is printed and you're asked to confirm before continuing; pass `-y`/`--yes` to skip the prompt (required for non-interactive/CI runs, which will otherwise abort with the same warning).
 
 ## Notes on the design
 
