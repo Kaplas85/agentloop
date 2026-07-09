@@ -7,6 +7,7 @@ Anthropic API — no API key involved, no per-token billing.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 
@@ -72,3 +73,38 @@ def git(args: list[str], cwd: str) -> str:
     if proc.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr}")
     return proc.stdout.strip()
+
+
+def git_ok(args: list[str], cwd: str) -> bool:
+    """Like git(), but returns success/failure instead of raising or returning output."""
+    proc = subprocess.run(["git", *args], cwd=cwd,
+                          capture_output=True, text=True)
+    return proc.returncode == 0
+
+
+def ensure_worktree(repo: str, branch: str, base_branch: str, worktree_root: str) -> str:
+    """Creates (or reuses) an isolated git worktree checked out to `branch`, so the
+    implementer never commits directly onto `base_branch`."""
+    path = os.path.join(worktree_root, branch.replace("/", "-"))
+    if os.path.exists(os.path.join(path, ".git")):
+        return path
+    os.makedirs(worktree_root, exist_ok=True)
+    if git_ok(["rev-parse", "--verify", branch], repo):
+        git(["worktree", "add", path, branch], repo)
+    else:
+        git(["worktree", "add", "-b", branch, path, base_branch], repo)
+    return path
+
+
+def merge_branch(repo: str, branch: str, base_branch: str) -> None:
+    """Merges an approved feature branch into base_branch in the main checkout."""
+    current = git(["rev-parse", "--abbrev-ref", "HEAD"], repo)
+    if current != base_branch:
+        git(["checkout", base_branch], repo)
+    git(["merge", "--no-ff", "--no-edit", branch], repo)
+
+
+def remove_worktree(repo: str, path: str, branch: str) -> None:
+    """Removes a feature worktree and its branch once it's been merged."""
+    git(["worktree", "remove", path, "--force"], repo)
+    git_ok(["branch", "-d", branch], repo)

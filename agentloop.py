@@ -20,7 +20,15 @@ import time
 
 from dotenv import load_dotenv
 
-from claude_runner import ClaudeRunError, extract_json_block, git, run_claude
+from claude_runner import (
+    ClaudeRunError,
+    ensure_worktree,
+    extract_json_block,
+    git,
+    merge_branch,
+    remove_worktree,
+    run_claude,
+)
 from trello_client import TrelloClient
 
 SHA_MARKER_RE = re.compile(r"\[agentloop\] before=(\S+) after=(\S+)")
@@ -84,6 +92,19 @@ def parse_last_shas(comments: list[str]) -> tuple[str, str] | tuple[None, None]:
     return None, None
 
 
+def slugify(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return slug[:40].strip("-") or "task"
+
+
+def branch_name_for_card(card: dict) -> str:
+    return f"agentloop/{slugify(card['name'])}-{card['id'][:8]}"
+
+
+def worktree_path_for(worktree_root: str, branch: str) -> str:
+    return os.path.join(worktree_root, branch.replace("/", "-"))
+
+
 def build_implement_prompt(card: dict, feedback: str | None) -> str:
     prompt = f"Task from Trello card '{card['name']}':\n\n{card.get('desc') or '(no description)'}"
     if feedback:
@@ -99,21 +120,34 @@ def build_review_prompt(card: dict, diff: str) -> str:
     )
 
 
-def implement(client: TrelloClient, card: dict, repo: str, list_ids: dict, dry_run: bool) -> None:
+def implement(
+    client: TrelloClient,
+    card: dict,
+    repo: str,
+    list_ids: dict,
+    dry_run: bool,
+    base_branch: str,
+    worktree_root: str,
+) -> None:
     comments = client.comments(card["id"])
     feedback = latest_request_changes_comment(comments)
     prompt = build_implement_prompt(card, feedback)
+    branch = branch_name_for_card(card)
 
     if dry_run:
-        log(f"[dry-run] would implement '{card['name']}' with prompt:\n{prompt}")
+        log(
+            f"[dry-run] would implement '{card['name']}' on branch '{branch}' "
+            f"with prompt:\n{prompt}"
+        )
         return
 
-    log(f"Implementing '{card['name']}'")
-    before_sha = git(["rev-parse", "HEAD"], repo)
+    log(f"Implementing '{card['name']}' on branch '{branch}'")
+    worktree = ensure_worktree(repo, branch, base_branch, worktree_root)
+    before_sha = git(["rev-parse", "HEAD"], worktree)
     try:
         run_claude(
             prompt,
-            cwd=repo,
+            cwd=worktree,
             permission_mode="bypassPermissions",
             append_system_prompt=IMPLEMENTER_RULES,
         )
@@ -121,10 +155,12 @@ def implement(client: TrelloClient, card: dict, repo: str, list_ids: dict, dry_r
         log(f"Implementer failed on '{card['name']}': {exc}")
         client.add_comment(card["id"], f"[agentloop] implementer error: {exc}")
         return
-    after_sha = git(["rev-parse", "HEAD"], repo)
+    after_sha = git(["rev-parse", "HEAD"], worktree)
 
     client.add_comment(
-        card["id"], f"[agentloop] before={before_sha} after={after_sha}")
+        card["id"],
+        f"[agentloop] before={before_sha} after={after_sha} branch={branch}",
+    )
     client.move_card(card["id"], list_ids["in_review"])
 
 
@@ -135,6 +171,8 @@ def review(
     list_ids: dict,
     max_review_rounds: int,
     dry_run: bool,
+    base_branch: str,
+    worktree_root: str,
 ) -> None:
     comments = client.comments(card["id"])
     before_sha, after_sha = parse_last_shas(comments)
@@ -174,6 +212,21 @@ def review(
         return
 
     if verdict.get("verdict") == "approve":
+        branch = branch_name_for_card(card)
+        worktree = worktree_path_for(worktree_root, branch)
+        try:
+            merge_branch(repo, branch, base_branch)
+            remove_worktree(repo, worktree, branch)
+        except RuntimeError as exc:
+            log(f"Could not merge/clean up branch '{branch}' for '{card['name']}': {exc}")
+            client.add_comment(
+                card["id"],
+                f"[agentloop] approved but merge into {base_branch} failed, needs a human: {exc}",
+            )
+            if list_ids.get("needs_human"):
+                client.move_card(card["id"], list_ids["needs_human"])
+            return
+
         client.add_comment(
             card["id"], f"[review] APPROVE: {verdict.get('summary', '')}")
         client.move_card(card["id"], list_ids["done"])
@@ -186,21 +239,30 @@ def review(
         client.move_card(card["id"], list_ids["in_progress"])
 
 
-def run_loop(client: TrelloClient, repo: str, list_ids: dict, args: argparse.Namespace) -> None:
+def run_loop(
+    client: TrelloClient,
+    repo: str,
+    list_ids: dict,
+    args: argparse.Namespace,
+    base_branch: str,
+    worktree_root: str,
+) -> None:
     while True:
         todo_cards = client.cards_in_list(list_ids["todo"])
         for card in todo_cards[: args.concurrency]:
             log(f"Picking up '{card['name']}' from To Do")
             if not args.dry_run:
                 client.move_card(card["id"], list_ids["in_progress"])
-            implement(client, card, repo, list_ids, args.dry_run)
+            implement(client, card, repo, list_ids,
+                      args.dry_run, base_branch, worktree_root)
 
         for card in client.cards_in_list(list_ids["in_progress"]):
-            implement(client, card, repo, list_ids, args.dry_run)
+            implement(client, card, repo, list_ids,
+                      args.dry_run, base_branch, worktree_root)
 
         for card in client.cards_in_list(list_ids["in_review"]):
-            review(client, card, repo, list_ids,
-                   args.max_review_rounds, args.dry_run)
+            review(client, card, repo, list_ids, args.max_review_rounds,
+                   args.dry_run, base_branch, worktree_root)
 
         if args.once:
             break
@@ -238,6 +300,18 @@ def main() -> None:
         action="store_true",
         help="don't call claude or mutate Trello, just print what would happen",
     )
+    parser.add_argument(
+        "--base-branch",
+        default=os.environ.get("BASE_BRANCH"),
+        help="branch each card's feature worktree is created from and merged back "
+             "into on approval (default: --repo's current branch)",
+    )
+    parser.add_argument(
+        "--worktree-dir",
+        default=os.environ.get("WORKTREE_DIR"),
+        help="directory to hold per-card git worktrees "
+             "(default: a .agentloop-worktrees folder next to --repo)",
+    )
     args = parser.parse_args()
 
     api_key = os.environ.get("TRELLO_API_KEY")
@@ -259,7 +333,12 @@ def main() -> None:
         },
     )
 
-    run_loop(client, args.repo, list_ids, args)
+    base_branch = args.base_branch or git(
+        ["rev-parse", "--abbrev-ref", "HEAD"], args.repo)
+    worktree_root = args.worktree_dir or os.path.join(
+        os.path.dirname(os.path.abspath(args.repo)), ".agentloop-worktrees")
+
+    run_loop(client, args.repo, list_ids, args, base_branch, worktree_root)
 
 
 if __name__ == "__main__":

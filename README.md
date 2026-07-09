@@ -17,12 +17,20 @@ To Do ──────────> In Progress ──────────
 ```
 
 - **To Do**: tasks waiting to be picked up. Card name + description become the task prompt.
-- **In Progress**: the implementer (`claude`, headless) works here — reads the task, edits files, commits.
+- **In Progress**: the implementer (`claude`, headless) works here — reads the task, edits files, commits. It never touches your main checkout directly: each card gets its own git worktree on its own branch (see below).
 - **In Review**: an adversarial reviewer (separate Claude invocation, sees *only* the diff) checks the change and either approves or requests changes.
-- **Done**: reviewer approved.
-- **Needs Human**: the card bounced between In Progress/In Review too many times (`--max-review-rounds`, default 3) without approval — the loop stops touching it so a person can step in.
+- **Done**: reviewer approved — the card's branch has been merged into your base branch and its worktree cleaned up.
+- **Needs Human**: the card bounced between In Progress/In Review too many times (`--max-review-rounds`, default 3) without approval, or an approved merge failed (e.g. conflict) — the loop stops touching it so a person can step in.
 
 All state (which git commit a card corresponds to, how many review rounds happened) is stored as comments on the Trello card itself, not in a local file — so the script can be killed and restarted without losing track of anything.
+
+## Isolated per-card git worktrees
+
+Instead of committing straight to your main branch, every card gets its own `git worktree` checked out to a dedicated branch (`agentloop/<card-name-slug>-<card-id>`), created off `--base-branch` under `--worktree-dir`. The implementer only ever writes/commits inside that worktree, so in-progress work never touches or dirties your main branch — and several cards can be worked on without their changes stepping on each other.
+
+When a reviewer approves a card, its branch is merged (`--no-ff`) back into `--base-branch` in your main checkout and the worktree + branch are deleted. If the merge fails (e.g. a conflict with another already-merged card), the card is routed to **Needs Human** instead of Done, and its worktree is left in place so you can resolve it by hand.
+
+Branch/worktree naming is derived deterministically from the card itself (not from comment state), so restarting the script reattaches to the same in-progress branch automatically.
 
 ## Setup
 
@@ -67,7 +75,7 @@ python agentloop.py --repo /path/to/target/repo --once
 python agentloop.py --repo /path/to/target/repo
 ```
 
-`--repo` is the local git checkout the implementer/reviewer will actually work in and commit to.
+`--repo` is the local git checkout the reviewer reads from and where approved branches get merged. The implementer itself works in a per-card worktree derived from `--repo` (see above), never in `--repo`'s working tree directly.
 
 ### All flags
 
@@ -79,6 +87,8 @@ python agentloop.py --repo /path/to/target/repo
 | `--concurrency` | 1 | max cards picked up from To Do per pass — keep low for a subscription plan |
 | `--max-review-rounds` | 3 | after this many "request changes" rounds, move the card to Needs Human |
 | `--dry-run` | off | don't call `claude` or mutate Trello, just log what would happen |
+| `--base-branch` | `--repo`'s current branch | branch each card's worktree is created from and merged back into on approval |
+| `--worktree-dir` | `.agentloop-worktrees` next to `--repo` | directory holding per-card git worktrees |
 
 ## Notes on the design
 
