@@ -76,7 +76,14 @@ def missing_docs(repo: str) -> list[str]:
             if not os.path.isfile(os.path.join(docs_dir, name))]
 
 
-def check_docs_or_confirm(repo: str, assume_yes: bool) -> None:
+def check_repo_or_exit(repo: str) -> None:
+    if not os.path.isdir(repo):
+        sys.exit(f"--repo path does not exist or is not a directory: {repo}")
+    if not os.path.exists(os.path.join(repo, ".git")):
+        sys.exit(f"--repo is not a git repository (no .git found): {repo}")
+
+
+def check_docs_or_confirm(repo: str, assume_yes: bool, dry_run: bool) -> None:
     missing = missing_docs(repo)
     if not missing:
         return
@@ -91,6 +98,10 @@ def check_docs_or_confirm(repo: str, assume_yes: bool) -> None:
         log("--yes passed, continuing despite missing docs")
         return
 
+    if dry_run:
+        log("--dry-run passed, continuing without prompting (dry runs never mutate state)")
+        return
+
     if not sys.stdin.isatty():
         raise SystemExit(
             "Refusing to continue without docs/CONVENTIONS.md and docs/CONTEXT.md "
@@ -98,7 +109,12 @@ def check_docs_or_confirm(repo: str, assume_yes: bool) -> None:
             "--yes to proceed anyway."
         )
 
-    answer = input("Continue anyway? [y/N] ").strip().lower()
+    try:
+        answer = input("Continue anyway? [y/N] ").strip().lower()
+    except EOFError:
+        raise SystemExit(
+            "Aborted: stdin closed before confirmation could be read"
+        )
     if answer not in ("y", "yes"):
         raise SystemExit("Aborted: missing docs/CONVENTIONS.md and/or docs/CONTEXT.md")
 
@@ -457,7 +473,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    check_docs_or_confirm(args.repo, args.yes)
+    check_repo_or_exit(args.repo)
+    check_docs_or_confirm(args.repo, args.yes, args.dry_run)
 
     api_key = os.environ.get("TRELLO_API_KEY")
     token = os.environ.get("TRELLO_TOKEN")
