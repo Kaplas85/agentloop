@@ -89,6 +89,11 @@ def ensure_worktree(repo: str, branch: str, base_branch: str, worktree_root: str
     if os.path.exists(os.path.join(path, ".git")):
         return path
     os.makedirs(worktree_root, exist_ok=True)
+    # Clears out git's records of any worktree whose directory was removed
+    # without `git worktree remove` (e.g. manually, or by a prior bug), which
+    # would otherwise make git think `branch` is still checked out elsewhere
+    # and permanently fail every future `worktree add` for it.
+    git_ok(["worktree", "prune"], repo)
     if git_ok(["rev-parse", "--verify", branch], repo):
         git(["worktree", "add", path, branch], repo)
     else:
@@ -97,11 +102,26 @@ def ensure_worktree(repo: str, branch: str, base_branch: str, worktree_root: str
 
 
 def merge_branch(repo: str, branch: str, base_branch: str) -> None:
-    """Merges an approved feature branch into base_branch in the main checkout."""
+    """Merges an approved feature branch into base_branch in the main checkout.
+
+    On failure (e.g. a conflict), aborts the in-progress merge so `repo` is
+    left in a clean state instead of stuck mid-merge and blocking every
+    subsequent card's merge attempt.
+    """
     current = git(["rev-parse", "--abbrev-ref", "HEAD"], repo)
     if current != base_branch:
         git(["checkout", base_branch], repo)
-    git(["merge", "--no-ff", "--no-edit", branch], repo)
+    proc = subprocess.run(
+        ["git", "merge", "--no-ff", "--no-edit", branch],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        git_ok(["merge", "--abort"], repo)
+        raise RuntimeError(
+            f"git merge --no-ff --no-edit {branch} into {base_branch} failed "
+            f"(merge aborted): {proc.stderr}")
 
 
 def remove_worktree(repo: str, path: str, branch: str) -> None:

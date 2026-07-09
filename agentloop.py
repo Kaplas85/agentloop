@@ -32,6 +32,7 @@ from claude_runner import (
 from trello_client import TrelloClient
 
 SHA_MARKER_RE = re.compile(r"\[agentloop\] before=(\S+) after=(\S+)")
+CLEANUP_PENDING_RE = re.compile(r"\[agentloop\] cleanup pending: branch=(\S+) worktree=(\S+)")
 
 IMPLEMENTER_RULES = (
     "You are operating unattended in headless mode as part of an automated "
@@ -234,9 +235,18 @@ def review(
         log(f"[dry-run] would review '{card['name']}' with diff of {len(diff)} chars")
         return
 
+    branch = branch_name_for_card(card)
+    worktree = worktree_path_for(worktree_root, branch)
+    review_cwd = worktree if os.path.isdir(worktree) else repo
+    if review_cwd is repo:
+        log(
+            f"worktree for '{card['name']}' not found at {worktree}, "
+            "reviewer will fall back to reading --repo (may be stale)"
+        )
+
     log(f"Reviewing '{card['name']}'")
     try:
-        result = run_claude(prompt, cwd=repo, permission_mode="plan")
+        result = run_claude(prompt, cwd=review_cwd, permission_mode="plan")
     except ClaudeRunError as exc:
         log(f"Reviewer failed on '{card['name']}': {exc}")
         return
@@ -248,13 +258,10 @@ def review(
         return
 
     if verdict.get("verdict") == "approve":
-        branch = branch_name_for_card(card)
-        worktree = worktree_path_for(worktree_root, branch)
         try:
             merge_branch(repo, branch, base_branch)
-            remove_worktree(repo, worktree, branch)
         except RuntimeError as exc:
-            log(f"Could not merge/clean up branch '{branch}' for '{card['name']}': {exc}")
+            log(f"Could not merge branch '{branch}' for '{card['name']}': {exc}")
             client.add_comment(
                 card["id"],
                 f"[agentloop] approved but merge into {base_branch} failed, needs a human: {exc}",
@@ -266,6 +273,15 @@ def review(
         client.add_comment(
             card["id"], f"[review] APPROVE: {verdict.get('summary', '')}")
         client.move_card(card["id"], list_ids["done"])
+
+        try:
+            remove_worktree(repo, worktree, branch)
+        except RuntimeError as exc:
+            log(f"Merged '{branch}' for '{card['name']}' but cleanup failed: {exc}")
+            client.add_comment(
+                card["id"],
+                f"[agentloop] cleanup pending: branch={branch} worktree={worktree} error={exc}",
+            )
     else:
         issues = "\n".join(f"- {issue}" for issue in verdict.get("issues", []))
         client.add_comment(
@@ -273,6 +289,31 @@ def review(
             f"[review] REQUEST_CHANGES: {verdict.get('summary', '')}\n{issues}",
         )
         client.move_card(card["id"], list_ids["in_progress"])
+
+
+def retry_pending_cleanup(client: TrelloClient, card: dict, repo: str) -> None:
+    """Retries worktree/branch removal for a merged card whose cleanup failed
+    earlier, so a stale worktree isn't left around forever."""
+    comments = client.comments(card["id"])
+    if any(text.startswith("[agentloop] cleanup done") for text in comments):
+        return
+    pending = next(
+        (text for text in comments if text.startswith("[agentloop] cleanup pending")),
+        None,
+    )
+    if pending is None:
+        return
+    match = CLEANUP_PENDING_RE.search(pending)
+    if match is None:
+        return
+    branch, worktree = match.group(1), match.group(2)
+    try:
+        remove_worktree(repo, worktree, branch)
+    except RuntimeError as exc:
+        log(f"Retry cleanup for '{card['name']}' still failing: {exc}")
+        return
+    log(f"Cleaned up branch '{branch}' for '{card['name']}' on retry")
+    client.add_comment(card["id"], f"[agentloop] cleanup done: branch={branch}")
 
 
 def run_loop(
@@ -299,6 +340,10 @@ def run_loop(
         for card in client.cards_in_list(list_ids["in_review"]):
             review(client, card, repo, list_ids, args.max_review_rounds,
                    args.dry_run, base_branch, worktree_root)
+
+        if not args.dry_run:
+            for card in client.cards_in_list(list_ids["done"]):
+                retry_pending_cleanup(client, card, repo)
 
         if args.once:
             break
